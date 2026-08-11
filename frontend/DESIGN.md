@@ -18,20 +18,22 @@ visual design system, and the day-by-day plan through demo day.
 | Piece | Owner | State |
 |---|---|---|
 | `/extraction` | Person A | **Done.** `extract_from_image()` works, tested on 11 images, ~75–78% field accuracy, documented in `FINDINGS.md` |
-| `/enrichment` | Person B | **Empty.** Nothing committed yet |
-| `/frontend` | Person C | **Vite + React 19 starter template only.** `App.jsx` is still the boilerplate counter page |
-| `/shared` | Team (Day 0) | **Does not exist.** No `schema.json`, no mocks |
-| `/backend` | Person C | Not created yet |
+| `/enrichment` | Person B | **Landed.** `build_full_profile()` in `merge.py`, plus `scoring.py`, `conflict_resolution.py`, `normalize.py`. Merged from `upstream/main` |
+| `/frontend` | Person C | **Done.** Upload → processing → profile → error states, all wired to the live API |
+| `/shared` | Person B | **Exists.** `schema.json` + `mocks/mock_products.json` (8 ground-truth records). We read these; we never write them |
+| `/backend` | Person C | **Done.** FastAPI, adapters for A and B, envelope assembly, 70 smoke checks green |
 
-Two things follow from this that shape the whole plan:
+Two things followed from the original state and still shape the design:
 
-1. **The Day 0 deliverable was skipped.** There is no locked schema and no mock
-   JSONs. The roadmap's entire "nobody blocks anybody" premise rests on those
-   files. Section 2 resolves this — and resolves it *without* asking Person A to
-   change any code.
-2. **Person A is ahead, Person B is behind.** The backend must therefore be built
+1. **The Day 0 deliverable was skipped.** There was no locked schema and no mock
+   JSONs when the backend was written. Section 2 resolves this — and resolves it
+   *without* asking Person A to change any code. B has since shipped his own
+   `shared/` files; Section 3.4 covers what reconciling them cost.
+2. **Person A was ahead, Person B was behind.** The backend was therefore built
    so that it produces a useful, demo-able profile with **extraction only**, and
    treats enrichment as an additive layer that can arrive late (Section 4.4).
+   That held: B's code dropped in behind the adapter with no change to the
+   frontend and no change to Person A's module.
 
 ---
 
@@ -246,20 +248,48 @@ Every object in `extracted_fields` is **already a valid field object** — A set
 3. **`genai.upload_file` is a network round-trip before generation even starts.**
    Budget several seconds. This drives the processing-screen design (Section 9.2).
 
-### 3.4 What Person B must return
+### 3.4 What Person B actually returns
 
-B's `build_full_profile(person_a_output, enrichment_output)` returns the full
-profile object (Section 3.2). Specifically B owns:
+This section was written as a request list. B has since shipped, and what he
+built differs from it in five ways that all landed on our side of the wire. His
+code is working and tested; the adapter absorbs the difference rather than asking
+him to rewrite it. Every mapping below lives in `assemble.py` / `adapters.py` and
+nowhere else.
 
-- Appending enriched field objects with real `source_type` / `source_reference`
-- Populating `unit` and `normalized_value`, and rewriting `value` to normalized form
-  (**never** touching `raw_value`)
-- Populating `conflicting_values` on conflicted fields
-- `completeness` (score, counts, `missing_fields`)
-- `identity.category`
+**His real signature and shape** — `build_full_profile(person_a_output,
+enrichment_output)` in `enrichment/merge.py`, returning **flat** keys:
 
-Until B exists, the backend synthesizes these itself (Section 6.4) so the UI never
-sees a missing key.
+```python
+{"image_filename": ..., "brand": ..., "model_number": ..., "serial_number": ...,
+ "specs": {"voltage_rating": "220V", ...},   # dict, not a field-object list
+ "confidence": "high",                       # ONE word for the whole profile
+ "completeness_score": 85,                   # 0–100 number, not a block
+ "missing_fields": ["weight"],
+ "conflicting_values": [{"field": "voltage_rating",
+                         "values": ["220V (manufacturer)", "230V (distributor)"]}]}
+```
+
+| # | Difference | How we absorb it |
+|---|---|---|
+| 1 | He reads **flat keys**; A emits a **list** of field objects | `adapters._flatten_for_person_b()` translates A → B on the way in. Neither of them changes. |
+| 2 | `enrichment_output` has **no importable producer** — his resolve/score loop is inside `enrich.py`'s `__main__` block | We pass `{}`, never `None` (his merge calls `.get()` on it and `None` would raise). `_import_enrichment_producer()` looks for four likely names, so the day he lifts that loop into a function it wires itself up. |
+| 3 | Confidence is **one word for the whole profile**; per-field numbers exist in `scoring.py` but `merge.py` drops them | Enriched rows inherit the word at the **bottom of its band** (`high`→0.85, `medium`→0.60, `unverified`→0.30). We do not fabricate a per-field number that his code never computed. |
+| 4 | `conflicting_values` are **display strings** with the source in parentheses, and **include the winning value** | `_split_annotated()` parses `"230V (distributor)"` back into value + source; the entry equal to the winner is dropped so the UI never shows a field disagreeing with itself. |
+| 5 | His spec names are a **different vocabulary** than A's (`voltage_rating` vs `rated_voltage`) | `FIELD_ALIASES` + `canonical_field_name()` give one spelling per property, applied to every row from either of them. Without it, `_dedupe` keys on the name, misses the collision, and the same property renders twice. |
+
+Two consequences worth stating plainly, because they are the honest-reporting
+rules this UI is built on:
+
+- **`confidence: "unverified"` is not an error.** It is B's "I found no sources
+  for this model." It surfaces as a warning — *"No sources found for this model —
+  label data is unverified"* — and the label data still renders.
+- **`completeness_score: 0` with an empty `missing_fields`** is his no-enrichment
+  mode, where the score is meaningless rather than true. We fall back to our own
+  count instead of rendering "0% · 2 of 2 fields", which is a contradiction a
+  judge would spot immediately.
+
+When B's module is absent entirely, the backend synthesizes these itself
+(Section 6.4) so the UI never sees a missing key.
 
 ---
 
@@ -523,18 +553,54 @@ envelope. It computes:
 - **`stages.enrichment`** — `"skipped"`
 - **`status`** — `"partial"`
 
-When B does land, this code path stops running. Nothing else changes.
+When B does land, this code path stops running for the fields he fills — but not
+entirely, and that turned out to matter. Three of these fallbacks still fire with
+his module present:
 
-### 6.5 Startup checks
+- **`completeness`** falls back to our count whenever his numbers say nothing
+  (`completeness_score: 0` with no `missing_fields` — his no-enrichment mode).
+  When he does send a real score we use it and caption it against **his** eight
+  expected fields from `scoring.py`, not our seventeen, so the number above the
+  caption and the caption itself describe the same arithmetic.
+- **`identity`** fills only the blanks from his flat top-level keys. A value read
+  off the photo label outranks the same value echoed back from a web search, so
+  ties go to A.
+- **`confidence_summary`** is always ours — he reports one word for the whole
+  profile and never a per-field number (Section 3.4, difference 3).
+
+### 6.5 Field-name canonicalization
+
+A and B name the same property differently: A reads `rated_voltage` and
+`normal_current` off the label, B's `scoring.py` calls them `voltage_rating` and
+`current_rating`. `_dedupe` keys on `field_name`, so left alone the collision
+never fires and one property renders as two rows — two voltages, two currents,
+side by side, with no indication they describe the same thing.
+
+`FIELD_ALIASES` in `assemble.py` maps every known spelling onto one canonical
+name, applied inside `normalize_field()` so it covers rows from A, from B, and
+from the mock store alike. The canonical spelling matches Person A's, because
+those are the names a person sees printed on the nameplate.
+
+His `missing_fields` are canonicalized the same way — otherwise the meter lists
+`voltage_rating` as missing while a row labelled `rated_voltage` sits above it
+holding a value.
+
+One consequence, in `_dedupe`: when the label row wins, the losing row's *own*
+`conflicting_values` are merged into the winner rather than discarded with it.
+Those alternates are B's web sources disagreeing among themselves — the evidence
+a human needs to settle the field. A real scan now renders as one row:
+`rated_voltage = 48V (label)` with `220V (web)` and `230V (distributor)` in the
+provenance panel.
+
+### 6.6 Startup checks
 
 On boot, log a readiness table and expose it at `/health`:
 
 ```
 GEMINI_API_KEY present ......... yes
 extraction module .............. ok
-enrichment module .............. NOT FOUND (stage will be skipped)
-tesseract binary ............... ok
-mocks loaded ................... 6 (from /shared/mocks)
+enrichment module .............. ok
+mocks loaded ................... 8 (from /shared/mocks)
 ```
 
 The mock count is whatever Person B has dropped in `/shared/mocks` at boot — zero is
@@ -957,11 +1023,45 @@ What Person C guarantees instead:
   sample-profile row rather than rendering a broken one.
 - **Any valid profile renders.** The UI is driven by the envelope's shape, not by
   known ids, so a mock added an hour before the demo needs no frontend change.
-- **Filenames are the ids.** `profile_01_breaker.json` → `GET /api/mocks/profile_01_breaker`.
-  No registry to keep in sync.
+- **Re-read on every request, not cached at import.** B can drop a file in during
+  the demo and it appears on the next request, no server restart.
 
-Coverage worth requesting from Person B, since each one exercises a distinct UI
-path that is otherwise untested:
+### 10.1 What B actually shipped
+
+`shared/mocks/mock_products.json` is **one file holding many records** under an
+`entries` key, not one profile per file — so the "filenames are the ids" rule
+above no longer describes it. Each record is *ground truth*: a transcription of
+what is printed on the label.
+
+```json
+{"image_filename": "breaker_01.jpg", "brand": "Siemens", "model_number": "QP120",
+ "serial_number": null, "specs": {"voltage_rating": "120/240V", "current_rating": "20A"}}
+```
+
+`mock_store.py` supports both layouts and turns each record into one selectable
+sample. Three decisions in that conversion, all about not overstating what a
+sample is:
+
+- **Ids come from the image filename's stem** (`breaker_01.jpg` → `breaker_01`),
+  falling back to a slugged model number, then to position. Stable and readable.
+- **Template rows are skipped.** His file and `schema.json` still carry
+  `REPLACE_ME` placeholder entries; those are filtered out rather than offered to
+  the judges as a product.
+- **A sample is never dressed up as a live scan.** These records carry no
+  confidence, no source URL, and no enrichment, so the profile reports
+  `enrichment: "skipped"`, `status: "partial"`, a fixed `0.6` confidence with
+  `source_type: "label"` and `source_reference: "sample data"`, and the warning
+  *"Sample data — label values only, not enriched."*
+
+Samples do get scored, through the same `assemble.score_fields()` a real scan
+uses, so the meter and confidence strip render for them. The score is honestly
+low — a label carries 4 of the 17 fields we expect, so `breaker_01` reads 24% —
+and that is the true answer for un-enriched ground truth. The alternative was a
+meter defaulting to "0% · 0 of 0 fields" above four visible rows, which is a
+fabricated number in the one place this UI must not fabricate.
+
+Coverage still worth requesting from Person B, since each one exercises a distinct
+UI path that is otherwise untested:
 
 | Profile | What it exercises in the UI |
 |---|---|
@@ -974,9 +1074,15 @@ path that is otherwise untested:
 | Non-Latin `raw_value` | Text overflow in the detail panel |
 | `status: failed`, `profile: null` | `ErrorView` with a recovery path |
 
-Every mock should validate against `/shared/schema.json` (Section 3) — that schema
-is the same contract the live pipeline fills, which is what keeps mock mode and real
-mode indistinguishable to the UI.
+His 8 records cover the first two rows of that table. The remaining six are the
+UI paths currently exercised only by `backend/smoke_test.py` — worth asking him
+for if there is time, but not blocking: the envelope handling for each is tested.
+
+Note that `/shared/schema.json` as committed is the **ground-truth template**
+(the same `image_filename` / `brand` / `specs` record shape as the mocks), not the
+profile envelope in Section 3.2. Two different documents ended up with one name.
+The envelope contract the UI actually consumes is the one in Section 3.2, and
+`smoke_test.py` is what enforces it.
 
 Dev toggle: `VITE_USE_MOCKS=true` makes `client.js` hit `/api/mocks/*` for every
 scan, so the frontend demos end-to-end with extraction and enrichment switched off.
@@ -1054,6 +1160,37 @@ deviation from the roadmap. It converts integration day from discovery into conf
 ---
 
 ## 12. Integration (Days 12–13)
+
+### 12.0 What integration actually found
+
+Steps 1–3 below have run against B's real merged code. Step 3's first worry —
+"field name collisions between A and B" — was real and is the reason Section 6.5
+exists. The resolution went the other way from what this section proposed: B does
+not merge into A's key, because that would mean asking him to rewrite working,
+tested code two days from the demo. The alias map absorbs it instead, on our side,
+in one function.
+
+`backend/smoke_test.py` is the executable version of this section — 70 checks,
+run with `python smoke_test.py`, exit 0 required. It covers the five envelope
+cases that matter: B present with real specs, B present with no web results, B's
+module absent, a future B who speaks our list shape, and the sample-data path. It
+is the file to re-run first if B pushes again, and it is deliberately written
+against **his real output**, not against his README.
+
+Four defects it caught that a visual pass would not have:
+
+| Defect | What the judge would have seen |
+|---|---|
+| B's `conflicting_values` include the winning value | A field disagreeing with itself in the provenance panel |
+| `completeness_score: 0` with 2 filled fields | A meter reading "0% · 2 of 2 fields" |
+| `voltage_rating` vs `rated_voltage` | The same voltage rendered as two separate rows |
+| Samples had fields but no score blocks | A meter reading "0% · 0 of 0" above four visible rows |
+
+Still open: `enrich.py:57` reads `GEMINI_KEY` while Person A and the backend both
+use `GEMINI_API_KEY`. A team-level note for B rather than something to patch in
+his file from here.
+
+### 12.1 Order of operations
 
 Order matters — one variable at a time:
 
