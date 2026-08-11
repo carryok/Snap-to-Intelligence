@@ -1,122 +1,106 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import './App.css'
+import { useEffect, useState } from 'react'
+import { useScan } from './api/useScan'
+import { UploadPanel } from './components/UploadPanel'
+import { ProcessingView } from './components/ProcessingView'
+import { ProfileView } from './components/ProfileView'
+import { ErrorView } from './components/ErrorView'
+import './styles/app.css'
 
-function App() {
-  const [count, setCount] = useState(0)
+function ThemeToggle() {
+  const [theme, setTheme] = useState(
+    () => document.documentElement.getAttribute('data-theme') || 'system'
+  )
+  // 'system' follows the OS, so the icon and the action have to track what is
+  // actually on screen. Reading data-theme alone offers a system-dark visitor
+  // "switch to dark", which does nothing.
+  const [systemDark, setSystemDark] = useState(
+    () => window.matchMedia('(prefers-color-scheme: dark)').matches
+  )
 
+  useEffect(() => {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)')
+    const sync = (e) => setSystemDark(e.matches)
+    mq.addEventListener('change', sync)
+    return () => mq.removeEventListener('change', sync)
+  }, [])
+
+  useEffect(() => {
+    if (theme === 'system') document.documentElement.removeAttribute('data-theme')
+    else document.documentElement.setAttribute('data-theme', theme)
+  }, [theme])
+
+  const isDark = theme === 'dark' || (theme === 'system' && systemDark)
+  const next = isDark ? 'light' : 'dark'
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.jsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
-
-      <div className="ticks"></div>
-
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
-
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
+    <button
+      type="button"
+      className="themebtn"
+      onClick={() => setTheme(next)}
+      aria-label={`Switch to ${next} theme`}
+      title={`Switch to ${next} theme`}
+    >
+      {isDark ? '☾' : '☀'}
+    </button>
   )
 }
 
-export default App
+export default function App() {
+  const {
+    status, stage, slow, file, previewUrl, envelope, uploadError, samples,
+    selectFile, clearFile, scan, loadMock, reset,
+  } = useScan()
+
+  return (
+    <div className="app">
+      <div className="app__glow" aria-hidden="true" />
+
+      <header className="topbar">
+        <div className="topbar__inner">
+          <span className="brandmark">
+            <span className="brandmark__dot" aria-hidden="true" />
+            Snap<span className="brandmark__light">to</span>Intelligence
+          </span>
+          <ThemeToggle />
+        </div>
+      </header>
+
+      <main className="main">
+        {(status === 'idle' || status === 'previewing') && (
+          <UploadPanel
+            file={file}
+            previewUrl={previewUrl}
+            error={uploadError}
+            samples={samples}
+            onSelect={selectFile}
+            onClear={clearFile}
+            onScan={scan}
+            onLoadMock={loadMock}
+          />
+        )}
+
+        {status === 'processing' && (
+          <ProcessingView stage={stage} slow={slow} previewUrl={previewUrl} />
+        )}
+
+        {status === 'results' && (
+          <ProfileView envelope={envelope} onReset={reset} />
+        )}
+
+        {status === 'error' && (
+          <ErrorView
+            error={envelope?.error}
+            detail={envelope?.error_detail}
+            samples={samples}
+            onRetry={() => scan('auto')}
+            onLoadMock={loadMock}
+            onReset={reset}
+          />
+        )}
+      </main>
+
+      <footer className="foot">
+        Every value is traceable to the source it came from.
+      </footer>
+    </div>
+  )
+}
