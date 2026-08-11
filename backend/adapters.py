@@ -35,17 +35,17 @@ def enrichment_available() -> bool:
         return False
     return any(
         (ENRICHMENT_DIR / name).is_file()
-        for name in ("build_profile.py", "enrich.py", "main.py")
+        for name in ("merge.py", "build_profile.py", "enrich.py", "main.py")
     )
 
 
 def _import_enrichment_entry():
     """
     Person B's deliverable is `build_full_profile(a_output, enrichment_output)`.
-    We don't know which module they'll put it in, so try the likely names.
-    Returns the callable, or None.
+    It lives in merge.py — his README says to import it from there — but the
+    other names stay in the list so a rename on his side doesn't break us.
     """
-    for module_name in ("build_profile", "enrich", "main"):
+    for module_name in ("merge", "build_profile", "enrich", "main"):
         try:
             module = __import__(module_name)
         except Exception:
@@ -54,6 +54,33 @@ def _import_enrichment_entry():
         if callable(fn):
             return fn
     return None
+
+
+def _flatten_for_person_b(extraction: dict) -> dict:
+    """
+    Person A returns a LIST of field objects; Person B reads FLAT KEYS:
+
+        A: {"extracted_fields": [{"field_name": "brand", "value": "Siemens"}, ...]}
+        B: person_a_output.get("brand")
+
+    Neither of them is wrong — they were built against the same schema doc a
+    week apart. Rather than make either rewrite working, tested code, the
+    translation lives here, which is the whole reason this file exists.
+    """
+    flat = {
+        "image_filename": extraction.get("image_filename"),
+        "brand": None,
+        "model_number": None,
+        "serial_number": None,
+    }
+    for field in extraction.get("extracted_fields") or []:
+        if not isinstance(field, dict):
+            continue
+        name = field.get("field_name")
+        if name in flat and flat[name] is None:
+            flat[name] = field.get("value")
+    return flat
+
 
 
 def run_extraction(image_path: str) -> dict:
@@ -105,27 +132,77 @@ def run_extraction(image_path: str) -> dict:
     return result
 
 
+def _import_enrichment_producer():
+    """
+    Find something that turns A's extraction into B's `enrichment_output`.
+
+    B's resolve/score loop currently lives inside enrich.py's `if __name__ ==
+    "__main__"` block, so there is no importable function that produces it yet
+    (his own build_full_profile is the only exported entry point). We look for
+    the likely names anyway: the day he lifts that loop into a function, this
+    picks it up with no change here.
+    """
+    candidates = (
+        "enrich_from_extraction",
+        "build_enrichment",
+        "run_enrichment",
+        "enrich_profile",
+    )
+    for module_name in ("merge", "enrich", "build_profile", "main"):
+        try:
+            module = __import__(module_name)
+        except Exception:
+            continue
+        for attr in candidates:
+            fn = getattr(module, attr, None)
+            if callable(fn):
+                return fn
+    return None
+
+
 def run_enrichment(extraction_result: dict) -> dict | None:
     """
     Call Person B's build_full_profile().
 
-    Returns their full profile dict, or None if enrichment is unavailable —
-    which is the expected case until Person B lands. None means "stage skipped",
-    and assemble.py fills the gap so the UI never sees a missing key.
+    Two arguments, per his README:
+        build_full_profile(person_a_output, enrichment_output)
+
+    person_a_output is flattened from A's list shape. enrichment_output comes
+    from B's producer when one exists, and is `{}` otherwise — NOT None, because
+    his merge calls .get() on it directly and None would raise. With `{}` his
+    function returns a valid profile whose specs are empty and whose confidence
+    reads "unverified", which is the honest description of a scan that never got
+    enriched.
+
+    Returns his profile dict, or None if enrichment is unavailable — None means
+    "stage skipped" and assemble.py fills the gap.
     """
     fn = _import_enrichment_entry()
     if fn is None:
         return None
 
+    flat = _flatten_for_person_b(extraction_result)
+
+    enrichment_output = {}
+    producer = _import_enrichment_producer()
+    if producer is not None:
+        try:
+            produced = producer(flat)
+            if isinstance(produced, dict):
+                enrichment_output = produced
+        except Exception:
+            pass  # best-effort; an empty enrichment is still a valid profile
+
     try:
-        result = fn(extraction_result, None)
+        result = fn(flat, enrichment_output)
     except TypeError:
         # Tolerate a single-argument signature.
         try:
-            result = fn(extraction_result)
+            result = fn(flat)
         except Exception:
             return None
     except Exception:
         return None
 
     return result if isinstance(result, dict) else None
+

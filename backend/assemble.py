@@ -30,8 +30,57 @@ SOURCE_AUTHORITY = {
 
 IDENTITY_FIELDS = ("brand", "model_number", "serial_number")
 
-# Stand-in expected-field list used only until Person B ships the real,
-# category-aware version. Deliberately generic industrial-product fields.
+# A and B name the same property differently — A reads "rated_voltage" off the
+# label (gemini_extract.py), B's scoring.py calls it "voltage_rating". Left
+# alone they become two rows for one property and _dedupe never fires, because
+# it keys on the name. One canonical spelling per property, applied to every
+# field from either of them. Ours matches Person A's, since those names are the
+# ones a person sees printed on the nameplate.
+FIELD_ALIASES = {
+    "voltage_rating": "rated_voltage",
+    "voltage": "rated_voltage",
+    "rated_volts": "rated_voltage",
+    "current_rating": "rated_current",
+    "normal_current": "rated_current",
+    "rated_amps": "rated_current",
+    "power": "power_rating",
+    "rated_power": "power_rating",
+    "materials": "material",
+    "operating_conditions": "operating_temperature",
+    "certification": "certifications",
+    "manufacturer": "brand",
+    "make": "brand",
+    "model": "model_number",
+    "part_number": "model_number",
+    "serial": "serial_number",
+    "weight_kg": "weight",
+    "enclosure": "enclosure_type",
+    "mounting": "mounting_type",
+    "ip": "ip_rating",
+    "origin": "country_of_origin",
+}
+
+
+def canonical_field_name(name) -> str:
+    """One spelling per property, whichever teammate produced the row."""
+    key = str(name).strip().lower()
+    return FIELD_ALIASES.get(key, key)
+
+
+# Person B ranks sources with his own four-word vocabulary (scoring.py,
+# conflict_resolution.py). Ours is longer because it also covers the photo
+# label, which he never sees. Map his onto ours; anything unrecognised lands on
+# generic_web rather than being invented.
+B_SOURCE_MAP = {
+    "manufacturer": "manufacturer_site",
+    "datasheet": "datasheet_pdf",
+    "distributor": "distributor",
+    "generic": "generic_web",
+}
+
+# Person B's own expected-field list, lifted from scoring.py so completeness
+# means the same thing on both sides of the wire. Ours is the fallback used
+# only when his module is absent.
 DEFAULT_EXPECTED_FIELDS = [
     "brand",
     "model_number",
@@ -51,6 +100,7 @@ DEFAULT_EXPECTED_FIELDS = [
     "mounting_type",
     "country_of_origin",
 ]
+
 
 
 def _now_iso() -> str:
@@ -111,7 +161,7 @@ def normalize_field(raw: dict) -> dict | None:
         )
 
     field = {
-        "field_name": str(field_name).strip(),
+        "field_name": canonical_field_name(field_name),
         "value": value,
         "raw_value": raw_value,
         "source_type": source_type,
@@ -151,9 +201,11 @@ def _dedupe(fields: list[dict]) -> list[dict]:
         else:
             winner, loser = existing, field
 
+        conflicts = winner.setdefault("conflicting_values", [])
+
         # Only record the loser as a conflict if it actually disagrees.
         if str(loser.get("value")) != str(winner.get("value")):
-            winner.setdefault("conflicting_values", []).append(
+            conflicts.append(
                 {
                     "value": loser.get("value"),
                     "source_type": loser["source_type"],
@@ -161,6 +213,17 @@ def _dedupe(fields: list[dict]) -> list[dict]:
                     "confidence": loser["confidence"],
                 }
             )
+
+        # The loser may itself have carried alternates — B's web sources
+        # disagreeing among themselves. Dropping the losing row must not drop
+        # those: they are the evidence a human needs to settle the field.
+        seen = {str(winner.get("value"))} | {str(c.get("value")) for c in conflicts}
+        for extra in loser.get("conflicting_values") or []:
+            if str(extra.get("value")) in seen:
+                continue
+            seen.add(str(extra.get("value")))
+            conflicts.append(extra)
+
         by_name[name] = winner
 
     return list(by_name.values())
@@ -198,6 +261,222 @@ def _confidence_summary(fields: list[dict]) -> dict:
     return {"overall": overall, **counts}
 
 
+# Person B reports one confidence word for the whole profile, not per field.
+# scoring.py computes a per-field number, but merge.py drops it before we see
+# it. Until that changes, an enriched field inherits the profile-level word —
+# and inherits it at the BOTTOM of its band, because a profile-wide "high" is
+# weaker evidence about one field than a measurement of that field would be.
+B_CONFIDENCE_WORD = {
+    "high": BAND_HIGH,
+    "medium": BAND_MEDIUM,
+    "low": 0.3,
+    "unverified": 0.3,
+}
+
+
+def _b_confidence(value, default=0.45) -> float:
+    """B's confidence is a word ('high'), a number (0.9), or missing."""
+    if isinstance(value, str):
+        return B_CONFIDENCE_WORD.get(value.strip().lower(), default)
+    try:
+        return _clamp01(float(value), default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _split_annotated(text):
+    """
+    Split Person B's display strings: "230V (distributor)" → ("230V", "distributor").
+
+    His conflicting_values are pre-formatted for humans rather than structured
+    (test_merge.py), and that parenthetical is the only record of which source a
+    value came from. Reading it back is recovering data he wrote down — not
+    guessing. Anything that doesn't match the pattern is returned unchanged with
+    no source, so a value containing ordinary parentheses is never mangled.
+    """
+    raw = str(text).strip()
+    if not raw.endswith(")") or "(" not in raw:
+        return raw, None
+    head, _, tail = raw.rpartition("(")
+    source = tail[:-1].strip().lower()
+    if source not in B_SOURCE_MAP:
+        return raw, None
+    return head.strip(), source
+
+
+
+def fields_from_person_b(enriched: dict) -> list[dict]:
+    """
+    Turn Person B's flat profile into field rows.
+
+    His shape (merge.py):
+        {"specs": {"voltage": "220V", ...},
+         "confidence": "high",
+         "conflicting_values": [{"field": "voltage",
+                                 "values": ["220V (manufacturer)", ...]}]}
+
+    Two things this deliberately does NOT do:
+
+      1. Invent per-field confidence. Every enriched row gets the same inherited
+         number, so a field is never shown as more certain than B actually said.
+      2. Invent a source_reference. B's merge output drops the URL that
+         extract_specs.py captured, so the row says "enrichment" rather than
+         naming a page we cannot actually cite. The footer promises every value
+         is traceable; a fabricated citation would break that promise.
+    """
+    if not isinstance(enriched, dict):
+        return []
+
+    specs = enriched.get("specs")
+    if not isinstance(specs, dict):
+        return []
+
+    inherited = _b_confidence(enriched.get("confidence"))
+
+    # conflicting_values is a flat list keyed by field name; index it first.
+    conflicts_by_field: dict[str, list] = {}
+    for entry in enriched.get("conflicting_values") or []:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("field")
+        if name:
+            conflicts_by_field.setdefault(str(name), []).extend(
+                entry.get("values") or []
+            )
+
+    rows = []
+    for name, value in specs.items():
+        # B's own resolved shape, if a future version passes it through whole.
+        if isinstance(value, dict):
+            final_value = value.get("final_value", value.get("value"))
+            confidence = _b_confidence(value.get("confidence"), inherited)
+            source_type = B_SOURCE_MAP.get(value.get("source_type"), "generic_web")
+            reference = value.get("source_reference") or "enrichment"
+            raw_conflicts = value.get("conflicting_values") or []
+        else:
+            final_value = value
+            confidence = inherited
+            source_type = "generic_web"
+            reference = "enrichment"
+            raw_conflicts = conflicts_by_field.get(str(name), [])
+
+        if final_value in (None, ""):
+            continue
+
+        # B's alternates include the value that WON, formatted for display
+        # ("220V (manufacturer)"). Listing the winner as a conflict with itself
+        # reads as a disagreement that doesn't exist, so drop it — and recover
+        # the source name he wrote in the parentheses while we're here.
+        conflicts = []
+        for candidate in raw_conflicts:
+            if candidate in (None, ""):
+                continue
+            if isinstance(candidate, dict):
+                c_value = candidate.get("value")
+                c_source = B_SOURCE_MAP.get(candidate.get("source_type"), "generic_web")
+                c_reference = candidate.get("source_reference") or "enrichment"
+            else:
+                c_value, c_source_word = _split_annotated(candidate)
+                c_source = B_SOURCE_MAP.get(c_source_word, "generic_web")
+                c_reference = c_source_word or "enrichment"
+            if c_value in (None, "") or str(c_value) == str(final_value):
+                continue
+            conflicts.append(
+                {
+                    "value": c_value,
+                    "source_type": c_source,
+                    "source_reference": c_reference,
+                    "confidence": confidence,
+                }
+            )
+
+        rows.append(
+            {
+                "field_name": str(name),
+                "value": final_value,
+                "raw_value": final_value,
+                "source_type": source_type,
+                "source_reference": reference,
+                "confidence": confidence,
+                "conflicting_values": conflicts,
+            }
+        )
+
+    return rows
+
+
+# The eight fields Person B's calculate_completeness() scores against
+# (enrichment/scoring.py). His profile reports the resulting percentage and the
+# names that came back empty, but not the denominator — so we keep his list here
+# to caption his number with the arithmetic he actually did.
+B_EXPECTED_FIELDS = (
+    "voltage_rating",
+    "current_rating",
+    "dimensions",
+    "materials",
+    "certifications",
+    "operating_conditions",
+    "compatible_products",
+    "weight",
+)
+
+
+def completeness_from_person_b(enriched: dict, fields: list[dict]) -> dict | None:
+    """
+    Use B's completeness_score when he sends a meaningful one.
+
+    His score is already weighted by average confidence (scoring.py), so we do
+    not recompute it — we only need the caption underneath it, which his output
+    doesn't carry. The denominator has to be HIS eight expected fields, not our
+    field list: his percentage counts specs, and our list also holds the identity
+    rows Person A read off the label, which his scoring never looked at. Mixing
+    the two produced captions like "2 of 2 fields · 0%".
+
+    Returns None when his numbers say nothing at all — score 0 with nothing
+    listed as missing, which is what merge.py emits when no enrichment ran. The
+    caller then falls back to counting the fields we actually have.
+    """
+    if not isinstance(enriched, dict):
+        return None
+    if "completeness_score" not in enriched:
+        return None
+
+    try:
+        score = round(float(enriched["completeness_score"]))
+    except (TypeError, ValueError):
+        return None
+
+    missing = [
+        canonical_field_name(m) for m in (enriched.get("missing_fields") or [])
+    ]
+    if not missing and score <= 0:
+        return None
+
+    # Union rather than his list alone, so a field he starts scoring tomorrow
+    # still lands in the denominator instead of pushing "filled" negative.
+    expected = {canonical_field_name(f) for f in B_EXPECTED_FIELDS} | set(missing)
+
+    return {
+        "score": max(0, min(100, score)),
+        "fields_filled": max(0, len(expected) - len(missing)),
+        "expected_fields": len(expected),
+        "missing_fields": missing,
+    }
+
+
+def score_fields(fields: list[dict]) -> tuple[dict, dict]:
+    """
+    Completeness + confidence blocks for an already-normalized field list.
+
+    Public because mock_store needs them: a sample profile has real fields, so
+    it should carry the same two blocks a scanned profile does. Without this the
+    meter falls back to its zero defaults and renders "0% · 0 of 0 fields" over a
+    sample that plainly shows four — a fabricated number, and the one thing this
+    UI is supposed to never do.
+    """
+    return _completeness(fields), _confidence_summary(fields)
+
+
 def build_envelope(
     extraction: dict,
     enriched: dict | None,
@@ -218,31 +497,58 @@ def build_envelope(
     enrichment_ok = False
 
     if enriched:
+        # Person B's real shape is a flat `specs` dict (merge.py). The `fields`
+        # / `extracted_fields` keys are checked first only so that a future
+        # version of his module that speaks our list shape still works.
         b_fields = enriched.get("fields") or enriched.get("extracted_fields") or []
+        if not b_fields:
+            b_fields = fields_from_person_b(enriched)
         if b_fields:
             raw_fields = raw_fields + list(b_fields)
+            enrichment_ok = True
+        # B also ran if he handed back a merge-shaped dict whose specs are
+        # empty — his documented "no web results" mode. Empty enrichment is
+        # still enrichment: it earns the "unverified" warning below, not the
+        # "module missing" one.
+        elif isinstance(enriched, dict) and "specs" in enriched:
             enrichment_ok = True
 
     fields = [f for f in (normalize_field(r) for r in raw_fields) if f]
     fields = _dedupe(fields)
 
     # --- completeness ------------------------------------------------------
+    # Label order matters: the photo label is ground truth for identity, so
+    # _dedupe keeps A's row and drops B's when they collide on a field name.
+    completeness = None
     if enrichment_ok and isinstance(enriched.get("completeness"), dict):
-        completeness = enriched["completeness"]
+        completeness = dict(enriched["completeness"])
         completeness.setdefault("missing_fields", [])
-    else:
+    elif enrichment_ok:
+        completeness = completeness_from_person_b(enriched, fields)
+    if completeness is None:
         completeness = _completeness(fields)
 
     # --- identity ----------------------------------------------------------
     identity = _identity_from_fields(fields)
-    if enrichment_ok and isinstance(enriched.get("identity"), dict):
-        for key, val in enriched["identity"].items():
-            if val:
-                identity[key] = val
+    if enrichment_ok:
+        if isinstance(enriched.get("identity"), dict):
+            for key, val in enriched["identity"].items():
+                if val:
+                    identity[key] = val
+        else:
+            # B's flat top-level keys. Only fill blanks: a value read off the
+            # label outranks the same value echoed back from a web search.
+            for key in IDENTITY_FIELDS:
+                if not identity.get(key) and enriched.get(key):
+                    identity[key] = enriched[key]
 
     # --- status ------------------------------------------------------------
     if not enrichment_ok:
         warnings.append("Enrichment unavailable — showing label data only.")
+    elif str(enriched.get("confidence", "")).strip().lower() == "unverified":
+        # B's documented degraded mode: model number found nothing on the web.
+        # He marks it "unverified" rather than hallucinating, so say that.
+        warnings.append("No sources found for this model — label data is unverified.")
 
     if extraction.get("used_fallback"):
         warnings.append("Primary vision model unavailable — used OCR fallback.")
